@@ -23,6 +23,7 @@ export async function createInventoryFixture({ fault = null } = {}) {
   let writes = 0;
   const nonce = randomUUID();
   const issued = new Map();
+  const timers = [];
   const mutate = operation => { operation(store); writes += 1; };
   const changesFor = skus => skus.filter(sku => !store.kit.some(line => line.sku === sku))
     .map(sku => ({ sku, quantity: 1 }));
@@ -56,6 +57,18 @@ export async function createInventoryFixture({ fault = null } = {}) {
           mutate(current => { current.available.bolts -= 1; });
           mutate(current => { current.available.bolts += 1; });
         }
+        if (fault === 'delayed-preview-write') {
+          timers.push(setTimeout(() => mutate(current => { current.available.bolts -= 1; }), 20));
+        }
+        if (fault === 'delayed-preview-late-write') {
+          timers.push(setTimeout(() => mutate(current => { current.available.bolts -= 1; }), 45));
+        }
+        if (fault === 'delayed-preview-rollback') {
+          timers.push(setTimeout(() => {
+            mutate(current => { current.available.bolts -= 1; });
+            mutate(current => { current.available.bolts += 1; });
+          }, 20));
+        }
         if (fault === 'wrong-preview') return response({ phase: 'preview', ...fresh, changes: [] });
         return response({ phase: 'preview', ...fresh });
       }
@@ -68,6 +81,9 @@ export async function createInventoryFixture({ fault = null } = {}) {
       const valid = current || fault === 'ignore-token' || acceptStale || acceptOtherScope || replay;
       if (!valid) {
         if (fault === 'error-after-mutation') reserve(fresh.changes);
+        if (fault === 'delayed-error-write') {
+          timers.push(setTimeout(() => reserve(fresh.changes), 20));
+        }
         return response({ phase: 'blocked', fresh }, true);
       }
       let applied = replay ? prior.changes : fresh.changes;
@@ -105,6 +121,9 @@ export async function createInventoryFixture({ fault = null } = {}) {
     expected: structuredClone({ initial: INITIAL, plan: PLAN, afterCommit: COMPLETE,
       changed: CHANGED, changedPlan: [{ sku: 'washers', quantity: 1 }], afterReconfirm: COMPLETE,
       commitWrites: 1, reconfirmWrites: 1 }),
-    close: connection.close,
+    close: async () => {
+      for (const timer of timers) clearTimeout(timer);
+      await connection.close();
+    },
   };
 }

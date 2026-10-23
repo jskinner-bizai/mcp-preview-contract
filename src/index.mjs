@@ -70,6 +70,11 @@ function timeoutValue(value = 2000) {
   return value;
 }
 
+function observationWindowValue(value = 50) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 2000) throw new TypeError('observationWindowMs must be an integer from 0 to 2000');
+  return value;
+}
+
 async function bounded(operation, timeoutMs) {
   let timer;
   try {
@@ -135,8 +140,9 @@ const CASES = [
  * Execute only against caller-owned disposable fixtures. Adapters/observers are
  * trusted test code, not a sandbox or a production security boundary.
  */
-export async function runPreviewContract({ name, createFixture, timeoutMs = 2000 }) {
+export async function runPreviewContract({ name, createFixture, timeoutMs = 2000, observationWindowMs = 50 }) {
   timeoutValue(timeoutMs);
+  observationWindowValue(observationWindowMs);
   if (typeof name !== 'string' || !name.trim() || name.length > 120 || /[\p{Cc}\p{Cf}]/u.test(name)) throw new TypeError('A short printable fixture name is required');
   if (typeof createFixture !== 'function') throw new TypeError('createFixture must be a function');
   const checks = [];
@@ -274,22 +280,73 @@ export async function runPreviewContract({ name, createFixture, timeoutMs = 2000
     } catch (error) {
       receipt.code = error instanceof Violation ? error.code : 'PROFILE_OR_OBSERVER_ERROR';
     } finally {
-      // Capture a last independent observation even if decoding failed after a
-      // write. This never turns an unknown outcome into a safe rejection.
+      // Post-response observation window: repeatedly sample state and journal
+      // within a bounded duration. A faulty handler may write after returning.
+      // This window cannot prove the absence of arbitrarily late writes.
       if (validated && typeof fixture.observer.snapshot === 'function') {
-        try {
-          const observed = await bounded(() => fixture.observer.snapshot(), timeoutMs);
-          if (observed && Number.isSafeInteger(observed.writes) && observed.writes >= 0 && Object.hasOwn(observed, 'state')) {
-            const clean = { state: clone(observed.state), writes: observed.writes };
-            if (last && clean.writes < last.writes) { receipt.passed = false; receipt.code = 'MUTATION_JOURNAL_MOVED_BACKWARD'; }
-            else if (last && (clean.writes !== last.writes || !same(clean.state, last.state))) {
-              receipt.finalObservationChanged = true;
-              if (receipt.passed) { receipt.passed = false; receipt.code = 'UNREQUESTED_CHANGE_BEFORE_CLEANUP'; }
+        const windowStart = performance.now();
+        const windowDeadline = windowStart + observationWindowMs;
+        const pollIntervalMs = observationWindowMs > 0 ? Math.min(10, Math.max(1, Math.floor(observationWindowMs / 5))) : 0;
+        // Reserve one complete observer timeout after the requested window for
+        // a terminal sample. An early sample can resolve after the deadline
+        // while still representing state captured before it.
+        const auditDeadline = windowDeadline + timeoutMs;
+        // Leave room for timer granularity without truncating longer windows.
+        // The public 2000 ms limit also caps this at 2002 observations.
+        const maxPolls = observationWindowMs === 0 ? 1 : observationWindowMs + 2;
+        let pollAttempts = 0;
+        let tookFinalObservation = false;
+
+        while (pollAttempts < maxPolls) {
+          const now = performance.now();
+          const shouldTakeFinal = observationWindowMs === 0 || now >= windowDeadline;
+
+          try {
+            const timeLeft = auditDeadline - now;
+            if (timeLeft <= 0) throw new Error('Observation budget exhausted');
+            const observed = await bounded(() => fixture.observer.snapshot(), Math.min(timeoutMs, timeLeft));
+            if (observed && Number.isSafeInteger(observed.writes) && observed.writes >= 0 && Object.hasOwn(observed, 'state')) {
+              const clean = { state: clone(observed.state), writes: observed.writes };
+              if (last && clean.writes < last.writes) {
+                receipt.passed = false;
+                receipt.code = 'MUTATION_JOURNAL_MOVED_BACKWARD';
+              } else if (last && (clean.writes !== last.writes || !same(clean.state, last.state))) {
+                receipt.finalObservationChanged = true;
+                if (receipt.passed) {
+                  receipt.passed = false;
+                  receipt.code = 'UNREQUESTED_CHANGE_BEFORE_CLEANUP';
+                }
+              }
+              last = clean;
+              const phase = shouldTakeFinal && observationWindowMs > 0 ? 'final-observation-after-window'
+                : (pollAttempts === 0 ? 'last-observed-before-cleanup' : `observation-poll-${pollAttempts}`);
+              receipt.observations.push({ phase, stateSha256: stateHash(clean.state), writes: clean.writes });
+
+              if (shouldTakeFinal) tookFinalObservation = true;
+
+              // Stop early if a change was detected
+              if (receipt.finalObservationChanged || tookFinalObservation) break;
+            } else {
+              receipt.passed = false;
+              receipt.code = 'INVALID_FINAL_OBSERVATION';
+              break;
             }
-            last = clean;
-            receipt.observations.push({ phase: 'last-observed-before-cleanup', stateSha256: stateHash(clean.state), writes: clean.writes });
-          } else { receipt.passed = false; receipt.code = 'INVALID_FINAL_OBSERVATION'; }
-        } catch { receipt.passed = false; receipt.code = 'FINAL_OBSERVATION_UNAVAILABLE'; }
+          } catch {
+            receipt.passed = false;
+            receipt.code = 'FINAL_OBSERVATION_UNAVAILABLE';
+            break;
+          }
+
+          pollAttempts += 1;
+
+          const delay = Math.min(pollIntervalMs, Math.max(0, windowDeadline - performance.now()));
+          if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+        }
+        // Budget exhaustion must never certify a window that was not observed.
+        if (receipt.passed && !tookFinalObservation) {
+          receipt.passed = false;
+          receipt.code = 'FINAL_OBSERVATION_UNAVAILABLE';
+        }
       }
       if (last) {
         receipt.afterStateSha256 = stateHash(last.state);

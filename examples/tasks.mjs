@@ -13,6 +13,7 @@ export async function createTaskFixture({ fault = null } = {}) {
   let writes = 0;
   const nonce = randomUUID();
   const issued = new Map();
+  const timers = [];
   const mutate = operation => { operation(board); writes += 1; };
   const actionsFor = ids => board.tasks.filter(task => ids.includes(task.id) && task.status !== 'done')
     .map(task => ({ taskId: task.id, status: 'done' }));
@@ -40,6 +41,18 @@ export async function createTaskFixture({ fault = null } = {}) {
           mutate(value => { value.tasks[2].status = 'done'; });
           mutate(value => { value.tasks[2].status = 'open'; });
         }
+        if (fault === 'delayed-preview-write') {
+          timers.push(setTimeout(() => mutate(value => { value.tasks[2].status = 'done'; }), 20));
+        }
+        if (fault === 'delayed-preview-late-write') {
+          timers.push(setTimeout(() => mutate(value => { value.tasks[2].status = 'done'; }), 45));
+        }
+        if (fault === 'delayed-preview-rollback') {
+          timers.push(setTimeout(() => {
+            mutate(value => { value.tasks[2].status = 'done'; });
+            mutate(value => { value.tasks[2].status = 'open'; });
+          }, 20));
+        }
         if (fault === 'wrong-preview') return response({ state: 'inspection', ...current, actions: [] });
         return response({ state: 'inspection', ...current });
       }
@@ -51,6 +64,9 @@ export async function createTaskFixture({ fault = null } = {}) {
       const valid = ticket === current.ticket || fault === 'ignore-token' || acceptStale || acceptOtherScope || replay;
       if (!valid) {
         if (fault === 'error-after-mutation') complete(current.actions);
+        if (fault === 'delayed-error-write') {
+          timers.push(setTimeout(() => complete(current.actions), 20));
+        }
         return response({ state: 'rejected', current }, true);
       }
       let applied = replay ? prior.actions : current.actions;
@@ -86,6 +102,9 @@ export async function createTaskFixture({ fault = null } = {}) {
     expected: structuredClone({ initial: INITIAL, plan: PLAN, afterCommit: COMPLETE,
       changed: CHANGED, changedPlan: [{ taskId: 'b', status: 'done' }], afterReconfirm: COMPLETE,
       commitWrites: 1, reconfirmWrites: 1 }),
-    close: connection.close,
+    close: async () => {
+      for (const timer of timers) clearTimeout(timer);
+      await connection.close();
+    },
   };
 }

@@ -65,6 +65,7 @@ export function runPreviewContract(options: {
   name: string;
   createFixture(): Promise<Fixture>;
   timeoutMs?: number;
+  observationWindowMs?: number;
 }): Promise<ContractReceipt>;
 export type OnceResult =
   | { kind: 'result' | 'tool-error'; result: unknown; attempts: 1 }

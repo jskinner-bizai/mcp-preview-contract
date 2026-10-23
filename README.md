@@ -43,6 +43,7 @@ const receipt = await runPreviewContract({
   name: 'task-completion',
   createFixture: createTaskFixture,
   timeoutMs: 2000,
+  observationWindowMs: 50,
 });
 
 console.log(JSON.stringify(receipt, null, 2));
@@ -90,7 +91,9 @@ The test sources also include deliberately faulty synthetic fixtures to check th
 
 The CLI prints JSON to standard output. Its receipt includes each scenario's pass/fail result, bounded failure code, call phases and outcomes, argument hashes, observed state hashes, mutation delta and cleanup status. It does not print raw tokens, tool arguments, full snapshots or arbitrary exception text. A caller-supplied fixture name is included, so keep names free of private information. Hashes identify values; they are not a secrecy guarantee for predictable data.
 
-The runner takes a final independent observation before cleanup. If the state or journal changes again after the scenario's last observation without another requested operation, an otherwise passing check fails with `UNREQUESTED_CHANGE_BEFORE_CLEANUP`; `finalObservationChanged` records the detected change. An unavailable, invalid or backward-moving final observation also fails the check. This catches observed late changes rather than retaining an earlier pass, but cannot rule out writes that occur after the final observation.
+The runner repeatedly samples the independent state and mutation journal during a bounded post-response observation window. If the state or journal changes after the scenario's last operation without another requested action, the check fails with `UNREQUESTED_CHANGE_BEFORE_CLEANUP` and sets `finalObservationChanged: true`. Each observation poll adds an entry to the `observations` array with phases like `last-observed-before-cleanup` and `observation-poll-1`. An unavailable, invalid or backward-moving observation also fails the check.
+
+The observation window can detect writes that occur within its configured duration, such as delayed mutations scheduled immediately after returning a response. It cannot prove the absence of arbitrarily late writes or writes scheduled after the window closes. A write followed by rollback must fail even when its final state hash is unchanged, because the mutation journal records both operations.
 
 | Exit code | CLI meaning |
 | --- | --- |
@@ -110,6 +113,14 @@ The helper does not invoke the callback again. It cannot prevent retries impleme
 
 A timeout does **not** cancel the underlying operation. A late operation may still write after the runner's last observation or while cleanup is attempted. The receipt preserves an unknown outcome rather than relabeling it as safe rejection. Do not use this runner against production state, purchases, messages, real user data or other irreversible operations.
 
+### Post-response observation window
+
+After each scenario finishes, the runner samples the state and mutation journal repeatedly during a bounded observation window. A faulty handler may return a preview or rejection and then mutate its backing state on a timer. The observation window can detect writes that occur within its configured duration.
+
+The `observationWindowMs` option defaults to 50 milliseconds with a maximum of 2000. Setting it to 0 disables polling and takes only one final snapshot. Otherwise, an unchanged passing case must take a terminal snapshot starting at or after the window deadline. Polling stops early on a detected change or observation failure. Each asynchronous snapshot is bounded by `timeoutMs`, and the overall audit budget is the window plus one `timeoutMs`; cleanup has its own existing timeout. The runner allows at most `observationWindowMs + 2` audit snapshots (at most 2002). Exhausting this budget without a terminal sample fails the case. JavaScript timers cannot interrupt synchronous observer code or a blocked event loop, and a timeout does not cancel a pending snapshot. If an otherwise passing case observes an unrequested state change or journal increment during this window, it fails with code `UNREQUESTED_CHANGE_BEFORE_CLEANUP`.
+
+This finite window **cannot** prove the absence of arbitrarily late writes, certify MCP compliance, establish human approval or protect production state. It can detect writes that happen within the configured delay but not writes scheduled for hours or days later. Observation is a practical testing aid, not a comprehensive guarantee. The existing timeout and trust limitations remain unchanged.
+
 The runner attempts bounded `close()` cleanup for each returned fixture. Failed cleanup fails the check. If factory creation times out, cleanup is recorded as `pending-factory`; a late returned fixture is scheduled for cleanup, but the receipt does not certify that cleanup completed. Factories must own cancellation, quiescence and resource disposal where their test environment needs them.
 
 Adapters, factories, observers and expected-state oracles are trusted executable test code. The library is not a sandbox and cannot verify that an adapter avoids external services. The observer must cover all relevant application/resource state and mutation paths, including changes that are later rolled back. Equal snapshots alone prove only no net change. The journal does not automatically cover token-issuance caches, telemetry, disk or network writes outside the declared projection.
@@ -122,4 +133,4 @@ Concurrency checks exercise one schedule; they do not prove correctness for ever
 - [Provenance and contribution scope](PROVENANCE.md): origin, AI assistance and the separate contribution boundary.
 - [MIT license](LICENSE), copyright 2026 Jordan Skinner. Dependencies retain their own licenses and notices; this project's MIT file does not relicense them.
 
-This is currently a local contribution candidate awaiting exact publication approval. `"private": true` in package.json blocks accidental npm registry publication. It does not prevent an authorized MIT-licensed GitHub source release. No public contribution URL, registry release, adoption or competition completion is claimed here.
+The [baseline source at c89abf0](https://github.com/jskinner-bizai/mcp-preview-contract/commit/c89abf0e9210f42912eed6a59108210e87dc208a) is public in the [project repository](https://github.com/jskinner-bizai/mcp-preview-contract). This Kiro-assisted observation-window revision updates that same MIT-licensed project. Check the repository history for the revision's actual publication state; local test receipts alone do not establish publication or a submitted entry. `"private": true` in package.json blocks accidental npm registry publication. No registry release, outside adoption or competition completion is claimed here.
